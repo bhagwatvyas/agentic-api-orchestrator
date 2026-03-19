@@ -1,0 +1,36 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run orchestrator",
+      "type": "shell",
+      "command": "python3",
+      "args": [
+        "main.py",
+        "Find flights from San Francisco to Tokyo and hotels there and weather there"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Show plan only",
+      "type": "shell",
+      "command": "python3",
+      "args": [
+        "main.py",
+        "--plan-only",
+        "Find flights from San Francisco to Tokyo and hotels there"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

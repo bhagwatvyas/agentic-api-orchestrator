@@ -1,0 +1,28 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Orchestrator",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "console": "integratedTerminal",
+      "args": [
+        "Find flights from San Francisco to Tokyo and hotels there and weather there"
+      ],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Plan Only",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "console": "integratedTerminal",
+      "args": [
+        "--plan-only",
+        "Find flights from San Francisco to Tokyo and hotels there"
+      ],
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}
