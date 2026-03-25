@@ -1,63 +1,116 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+import json
+import re
 from typing import Any
+
+from planner import Plan
+
+
+STATE_REF_PATTERN = re.compile(r"\{\{steps\.([a-zA-Z0-9_-]+)\.output(?:\.([a-zA-Z0-9_.-]+))?\}\}")
 
 
 @dataclass(slots=True)
-class WorkflowState:
-    """
-    Stores intermediate data so later steps can reference previous outputs.
+class StepRunState:
+    step_id: str
+    action_type: str
+    status: str = "pending"
+    attempts: int = 0
+    output: Any = None
+    failure_reason: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
 
-    Data is kept in a simple nested dictionary to make serialization and debug
-    inspection straightforward.
-    """
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
-    data: dict[str, Any] = field(
-        default_factory=lambda: {
-            "steps": [],
-            "tool_outputs": {},
-            "context": {},
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "StepRunState":
+        return cls(**payload)
+
+
+@dataclass(slots=True)
+class RunRecord:
+    plan: Plan
+    status: str = "pending"
+    steps: dict[str, StepRunState] = field(default_factory=dict)
+    created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    updated_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+
+    def __post_init__(self) -> None:
+        if not self.steps:
+            self.steps = {
+                step.id: StepRunState(step_id=step.id, action_type=step.action_type)
+                for step in self.plan.steps
+            }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "plan": self.plan.to_dict(),
+            "status": self.status,
+            "steps": {step_id: state.to_dict() for step_id, state in self.steps.items()},
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
         }
-    )
 
-    def set_context(self, key: str, value: Any) -> None:
-        self.data["context"][key] = value
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "RunRecord":
+        record = cls(
+            plan=Plan.from_dict(payload["plan"]),
+            status=payload["status"],
+            steps={key: StepRunState.from_dict(value) for key, value in payload["steps"].items()},
+            created_at=payload["created_at"],
+            updated_at=payload["updated_at"],
+        )
+        return record
 
-    def add_step_result(self, *, tool_name: str, args: dict[str, Any], output: Any) -> None:
-        step_index = len(self.data["steps"])
-        record = {
-            "index": step_index,
-            "tool": tool_name,
-            "args": args,
-            "output": output,
-        }
-        self.data["steps"].append(record)
-        self.data["tool_outputs"].setdefault(tool_name, []).append(output)
+    def mark_updated(self) -> None:
+        self.updated_at = datetime.now(UTC).isoformat()
 
-    def snapshot(self) -> dict[str, Any]:
-        return self.data
+    def get_step_output(self, step_id: str) -> Any:
+        try:
+            return self.steps[step_id].output
+        except KeyError as exc:
+            raise KeyError(f"Unknown step id {step_id!r}") from exc
 
-    def get(self, path: str) -> Any:
-        """
-        Resolves dotted paths like:
-        - steps.0.output.city
-        - tool_outputs.search_flights.0.options
-        - context.original_request
-        """
 
-        current: Any = self.data
-        for part in path.split("."):
-            if isinstance(current, list):
-                current = current[int(part)]
-                continue
+def resolve_inputs(value: Any, run: RunRecord) -> Any:
+    if isinstance(value, dict):
+        return {key: resolve_inputs(item, run) for key, item in value.items()}
+    if isinstance(value, list):
+        return [resolve_inputs(item, run) for item in value]
+    if isinstance(value, str):
+        return _resolve_string(value, run)
+    return value
 
-            if isinstance(current, dict):
-                if part not in current:
-                    raise KeyError(f"State path not found: {path}")
-                current = current[part]
-                continue
 
-            raise KeyError(f"Cannot traverse path {path!r} beyond {part!r}")
+def _resolve_string(value: str, run: RunRecord) -> Any:
+    full_match = STATE_REF_PATTERN.fullmatch(value)
+    if full_match:
+        return _resolve_reference(full_match.group(1), full_match.group(2), run)
 
+    def replace(match: re.Match[str]) -> str:
+        resolved = _resolve_reference(match.group(1), match.group(2), run)
+        if isinstance(resolved, str):
+            return resolved
+        return json.dumps(resolved, sort_keys=True)
+
+    return STATE_REF_PATTERN.sub(replace, value)
+
+
+def _resolve_reference(step_id: str, path: str | None, run: RunRecord) -> Any:
+    current = run.get_step_output(step_id)
+    if path is None:
         return current
+
+    for part in path.split("."):
+        if isinstance(current, list):
+            current = current[int(part)]
+            continue
+        if isinstance(current, dict):
+            current = current[part]
+            continue
+        raise KeyError(f"Cannot resolve path {path!r} from step {step_id!r}")
+    return current

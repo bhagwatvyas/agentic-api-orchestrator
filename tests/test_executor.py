@@ -1,57 +1,102 @@
-from executor import ExecutionError, WorkflowExecutor
-from memory import WorkflowState
-from planner import PlanStep
-from tools import build_default_registry
-from tools.base import Tool, ToolRegistry
+from pathlib import Path
+
+from executor import WorkflowExecutor
+from memory import RunRecord
+from planner import MockPlanner
+from run_store import RunStore
 
 
-def test_executor_resolves_state_placeholders_between_steps() -> None:
-    executor = WorkflowExecutor(build_default_registry(), max_retries=1)
-    state = WorkflowState()
+def test_executor_applies_patch_and_runs_validation(tmp_path) -> None:
+    _write_sample_repo(tmp_path)
+    plan = MockPlanner().create_plan("Add a --dry-run flag and update tests", target_repo=str(tmp_path))
+    store = RunStore(tmp_path / ".agentic_dev" / "runs")
+    executor = WorkflowExecutor(store=store)
 
-    plan = [
-        PlanStep(tool="search_flights", args={"origin": "San Francisco", "destination": "Tokyo"}),
-        PlanStep(tool="search_hotels", args={"city": "{{state.steps.0.output.destination}}"}),
-    ]
+    run = executor.start(plan)
+    completed = executor.execute(run)
 
-    results, final_state = executor.execute(plan, state=state)
-
-    assert len(results) == 2
-    assert results[1].output["city"] == "Tokyo"
-    assert final_state.get("steps.1.args.city") == "Tokyo"
-
-
-def test_executor_retries_before_succeeding() -> None:
-    calls = {"count": 0}
-
-    def flaky_tool(city: str) -> dict[str, str]:
-        calls["count"] += 1
-        if calls["count"] == 1:
-            raise RuntimeError("temporary failure")
-        return {"city": city}
-
-    registry = ToolRegistry()
-    registry.register(Tool(name="flaky_tool", description="Fails once", func=flaky_tool))
-    executor = WorkflowExecutor(registry, max_retries=1)
-
-    results, _ = executor.execute([PlanStep(tool="flaky_tool", args={"city": "Lisbon"})])
-
-    assert calls["count"] == 2
-    assert results[0].attempts == 2
-    assert results[0].output == {"city": "Lisbon"}
+    assert completed.status == "succeeded"
+    assert completed.steps["apply_patch"].output["changed_files"] == ["main.py", "tests/test_main.py"]
+    assert "--dry-run" in (tmp_path / "main.py").read_text()
+    assert "test_main_dry_run_prints_payload" in (tmp_path / "tests/test_main.py").read_text()
 
 
-def test_executor_raises_after_exhausting_retries() -> None:
-    def broken_tool() -> None:
-        raise RuntimeError("permanent failure")
+def test_executor_resume_skips_completed_steps(tmp_path) -> None:
+    _write_sample_repo(tmp_path)
+    plan = MockPlanner().create_plan("Add a --dry-run flag and update tests", target_repo=str(tmp_path))
+    store = RunStore(tmp_path / ".agentic_dev" / "runs")
+    executor = WorkflowExecutor(store=store)
 
-    registry = ToolRegistry()
-    registry.register(Tool(name="broken_tool", description="Always fails", func=broken_tool))
-    executor = WorkflowExecutor(registry, max_retries=1)
+    partial_run = RunRecord(plan=plan)
+    partial_run.steps["inspect_repo"].status = "succeeded"
+    partial_run.steps["inspect_repo"].output = {
+        "discovered_files": ["main.py", "tests/test_main.py"],
+        "files": {},
+    }
+    partial_run.steps["propose_patch"].status = "succeeded"
+    partial_run.steps["propose_patch"].output = {
+        "patch": {
+            "change_kind": "add_dry_run_flag",
+            "files": [
+                {
+                    "path": "main.py",
+                    "before": (tmp_path / "main.py").read_text(),
+                    "after": (tmp_path / "main.py").read_text().replace(
+                        '    parser.add_argument("request", help="User request.")\n',
+                        '    parser.add_argument("request", help="User request.")\n'
+                        '    parser.add_argument("--dry-run", action="store_true", help="Show parsed input and exit.")\n',
+                    ),
+                },
+                {
+                    "path": "tests/test_main.py",
+                    "before": (tmp_path / "tests/test_main.py").read_text(),
+                    "after": (tmp_path / "tests/test_main.py").read_text()
+                    + '\n\ndef test_placeholder() -> None:\n    assert True\n',
+                },
+            ],
+        },
+        "summary": "ready",
+    }
+    store.save(partial_run)
 
-    try:
-        executor.execute([PlanStep(tool="broken_tool", args={})])
-    except ExecutionError as exc:
-        assert "broken_tool" in str(exc)
-    else:
-        raise AssertionError("Expected ExecutionError when retries are exhausted")
+    resumed = executor.execute(store.load(plan.run_id))
+
+    assert resumed.steps["inspect_repo"].attempts == 0
+    assert resumed.steps["propose_patch"].attempts == 0
+    assert resumed.steps["apply_patch"].status == "succeeded"
+
+
+def _write_sample_repo(repo_path: Path) -> None:
+    (repo_path / "tests").mkdir(parents=True, exist_ok=True)
+    (repo_path / "main.py").write_text(
+        "from __future__ import annotations\n"
+        "\n"
+        "import argparse\n"
+        "\n"
+        "\n"
+        "def build_parser() -> argparse.ArgumentParser:\n"
+        '    parser = argparse.ArgumentParser(description="Sample CLI")\n'
+        '    parser.add_argument("request", help="User request.")\n'
+        "    return parser\n"
+        "\n"
+        "\n"
+        "def main(argv: list[str] | None = None) -> None:\n"
+        "    args = build_parser().parse_args(argv)\n"
+        '    print(args.request)\n'
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n"
+    )
+    (repo_path / "tests/test_main.py").write_text(
+        "import json\n"
+        "\n"
+        "from main import main\n"
+        "\n"
+        "\n"
+        "def test_main_prints_request(capsys) -> None:\n"
+        '    main(["hello"])\n'
+        "\n"
+        "    captured = capsys.readouterr()\n"
+        '    assert captured.out.strip() == "hello"\n'
+    )

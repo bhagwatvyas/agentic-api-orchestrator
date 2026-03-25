@@ -1,92 +1,74 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-import re
-from typing import Any, Callable
+from datetime import UTC, datetime
+from pathlib import Path
 
-from memory import WorkflowState
-from planner import PlanStep
-from tools import ToolRegistry
-
-
-STATE_REF_PATTERN = re.compile(r"\{\{state\.([a-zA-Z0-9_.]+)\}\}")
+from actions import ActionContext, ActionError, run_action
+from memory import RunRecord, resolve_inputs
+from planner import Plan
 
 
 class ExecutionError(Exception):
-    """Raised when a workflow step cannot be executed successfully."""
-
-
-@dataclass(slots=True)
-class StepExecution:
-    step: PlanStep
-    attempts: int
-    output: Any
+    """Raised when execution cannot complete successfully."""
 
 
 class WorkflowExecutor:
-    def __init__(self, registry: ToolRegistry, *, max_retries: int = 1) -> None:
-        self._registry = registry
-        self._max_retries = max_retries
+    def __init__(self, *, store: "RunStore") -> None:
+        self._store = store
 
-    def execute(
-        self,
-        plan: list[PlanStep],
-        *,
-        state: WorkflowState | None = None,
-        on_step_failure: Callable[[PlanStep, Exception, WorkflowState], list[PlanStep] | None] | None = None,
-    ) -> tuple[list[StepExecution], WorkflowState]:
-        workflow_state = state or WorkflowState()
-        results: list[StepExecution] = []
+    def start(self, plan: Plan) -> RunRecord:
+        run = RunRecord(plan=plan, status="pending")
+        self._store.save(run)
+        return run
 
-        step_index = 0
-        while step_index < len(plan):
-            step = plan[step_index]
-            resolved_args = self._resolve_value(step.args, workflow_state)
+    def execute(self, run: RunRecord) -> RunRecord:
+        context = ActionContext(repo_path=Path(run.plan.target_repo))
+        run.status = "running"
+        run.mark_updated()
+        self._store.save(run)
 
-            last_error: Exception | None = None
-            for attempt in range(1, self._max_retries + 2):
-                try:
-                    output = self._registry.invoke(step.tool, **resolved_args)
-                    workflow_state.add_step_result(tool_name=step.tool, args=resolved_args, output=output)
-                    results.append(StepExecution(step=step, attempts=attempt, output=output))
-                    break
-                except Exception as exc:  # noqa: BLE001
-                    last_error = exc
-                    if attempt > self._max_retries:
-                        if on_step_failure:
-                            replanned = on_step_failure(step, exc, workflow_state)
-                            if replanned:
-                                plan = plan[:step_index] + replanned
-                                break
-                        raise ExecutionError(
-                            f"Step {step_index} failed for tool {step.tool!r}: {exc}"
-                        ) from exc
-            else:
-                raise ExecutionError(f"Unexpected executor state for step {step_index}.")
-
-            if last_error and on_step_failure and step_index >= len(results):
+        for step in run.plan.steps:
+            step_state = run.steps[step.id]
+            if step_state.status == "succeeded":
                 continue
 
-            step_index += 1
+            inputs = resolve_inputs(step.inputs, run)
+            attempts_allowed = step.retry_policy.max_attempts if step.retry_policy.retryable else 1
 
-        return results, workflow_state
+            step_state.status = "running"
+            step_state.started_at = datetime.now(UTC).isoformat()
+            step_state.failure_reason = None
+            self._store.save(run)
 
-    def _resolve_value(self, value: Any, state: WorkflowState) -> Any:
-        if isinstance(value, dict):
-            return {key: self._resolve_value(sub_value, state) for key, sub_value in value.items()}
-        if isinstance(value, list):
-            return [self._resolve_value(item, state) for item in value]
-        if isinstance(value, str):
-            return self._resolve_string(value, state)
-        return value
+            last_error: Exception | None = None
+            for attempt in range(1, attempts_allowed + 1):
+                step_state.attempts = attempt
+                try:
+                    output = run_action(step.action_type, inputs, context)
+                    step_state.output = output
+                    step_state.status = "succeeded"
+                    step_state.finished_at = datetime.now(UTC).isoformat()
+                    step_state.failure_reason = None
+                    run.mark_updated()
+                    self._store.save(run)
+                    break
+                except ActionError as exc:
+                    last_error = exc
+                    step_state.failure_reason = str(exc)
+                    step_state.finished_at = datetime.now(UTC).isoformat()
+                    run.mark_updated()
+                    self._store.save(run)
+            else:
+                step_state.status = "failed"
+                run.status = "failed"
+                run.mark_updated()
+                self._store.save(run)
+                raise ExecutionError(f"Step {step.id!r} failed: {last_error}") from last_error
 
-    def _resolve_string(self, value: str, state: WorkflowState) -> Any:
-        full_match = STATE_REF_PATTERN.fullmatch(value)
-        if full_match:
-            return state.get(full_match.group(1))
+        run.status = "succeeded"
+        run.mark_updated()
+        self._store.save(run)
+        return run
 
-        def replace(match: re.Match[str]) -> str:
-            resolved = state.get(match.group(1))
-            return str(resolved)
 
-        return STATE_REF_PATTERN.sub(replace, value)
+from run_store import RunStore

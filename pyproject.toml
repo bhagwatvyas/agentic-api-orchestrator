@@ -3,16 +3,16 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agentic-api-orchestrator"
+name = "agentic-dev-platform"
 version = "0.1.0"
-description = "Convert natural language into multi-step API workflows."
+description = "Deterministic developer workflow planning and execution from constrained natural language."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [
   { name = "Vyas Bhagwat" }
 ]
-keywords = ["agents", "api", "workflow", "orchestration", "llm"]
+keywords = ["agents", "developer-tools", "workflow", "orchestration", "cli"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
@@ -27,10 +27,10 @@ dependencies = []
 dev = ["pytest==9.0.2"]
 
 [project.scripts]
-agentic-api-orchestrator = "main:main"
+agentic-dev = "main:main"
 
 [tool.setuptools]
-py-modules = ["main", "planner", "executor", "memory"]
+py-modules = ["main", "planner", "executor", "memory", "validator", "actions", "reporter", "run_store"]
 
 [tool.setuptools.packages.find]
 include = ["tools"]

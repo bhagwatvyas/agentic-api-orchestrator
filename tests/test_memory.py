@@ -1,15 +1,12 @@
-from memory import WorkflowState
+from memory import RunRecord, resolve_inputs
+from planner import MockPlanner
 
 
-def test_workflow_state_stores_and_resolves_nested_values() -> None:
-    state = WorkflowState()
-    state.set_context("original_request", "Plan a trip")
-    state.add_step_result(
-        tool_name="search_flights",
-        args={"origin": "SFO", "destination": "Tokyo"},
-        output={"destination": "Tokyo", "options": [{"airline": "SkyJet"}]},
-    )
+def test_resolve_inputs_reads_prior_step_outputs(tmp_path) -> None:
+    plan = MockPlanner().create_plan("Add a --dry-run flag and update tests", target_repo=str(tmp_path))
+    run = RunRecord(plan=plan)
+    run.steps["inspect_repo"].output = {"discovered_files": ["main.py", "tests/test_main.py"]}
 
-    assert state.get("context.original_request") == "Plan a trip"
-    assert state.get("steps.0.output.destination") == "Tokyo"
-    assert state.get("tool_outputs.search_flights.0.options.0.airline") == "SkyJet"
+    resolved = resolve_inputs(plan.steps[1].inputs, run)
+
+    assert resolved["targets"] == ["main.py", "tests/test_main.py"]
